@@ -312,7 +312,7 @@ var o=[];var l=Array.isArray(e);for(f=n.s.c;f<=n.e.c;++f)s[f]=ya(f);for(var c=n.
 
 </script>
 <script type="text/plain" id="gscode">/**
- * SOES Google Sheets connector (Google Apps Script web app) · version 2
+ * SOES Google Sheets connector (Google Apps Script web app) · version 3 (adds the SOES mobile app)
  * Secure Offline Examination System · LCUP Senior High School
  *
  * The SOES Owner and Teacher portals call this web app when they are online to:
@@ -322,7 +322,11 @@ var o=[];var l=Array.isArray(e);for(f=n.s.c;f<=n.e.c;++f)s[f]=ya(f);for(var c=n.
  *   - send and answer improvement suggestions, and read the roadmap (SOES System Improvements)
  *   - read an exam written in a copy of the SOES Exam Question Template
  *   - save and restore backups in a Google Drive folder named "SOES Backups"
- * The Student portal never contacts this web app; it works fully offline.
+ *   - (version 3) serve the SOES mobile app: student accounts checked against the Student
+ *     Registry, quiz packages, uploaded submissions, and released results, kept in Drive
+ *     folders named "SOES Packages", "SOES Submissions", and "SOES Results"
+ * Answering an exam never needs this web app; it works fully offline. Students use it only to
+ * register, download packages, upload finished submissions, and receive released results.
  *
  * Security
  *   Every request carries the API key. Requests that read or change school data also
@@ -353,8 +357,10 @@ const SOES = {
   TEMPLATE_ID: '1-VdkXKuuIVC6oWr-ctUr7B-nIc8E5NSyNYiaHUvlb70',
   IMPROVE_ID:  '1yA5VrDFICp0TTYoLEhemjBqI8EtbzK4nyYoHQ35hUgU',
   TZ: 'Asia/Manila',
-  VERSION: '2.0'
+  VERSION: '3.0'
 };
+const STUDENT_LOCK_AFTER = 5;      // wrong PINs before a student account is paused
+const STUDENT_LOCK_MINUTES = 15;
 const A = {USER:0, EMAIL:1, NAME:2, EMP:3, DEPT:4, SUBJ:5, SECT:6, CONTACT:7, ROLE:8, STATUS:9, START:10, END:11, MUST:12, LAST:13, NOTES:14, SALT:15, HASH:16, ASALT:17, AVER:18, ITER:19, PWUPD:20, BY:21};
 const ACOLS = 22;
 
@@ -364,7 +370,7 @@ function setup() {
   let key = props.getProperty('SOES_API_KEY');
   if (!key) { key = newKey_(); props.setProperty('SOES_API_KEY', key); }
   [SOES.ACCOUNTS_ID, SOES.STUDENTS_ID, SOES.SCORES_ID, SOES.TEMPLATE_ID, SOES.IMPROVE_ID].forEach(id => SpreadsheetApp.openById(id).getName());
-  backupFolder_();
+  backupFolder_(); ['SOES Packages', 'SOES Submissions', 'SOES Results'].forEach(folder_); studentSheet_();
   Logger.log('SOES API key (enter this in the Owner portal): ' + key);
 }
 function rotateKey() {
@@ -389,6 +395,19 @@ function doPost(e) {
       case 'getUsers': return json_({ok: true, users: readAccounts_().map(publicUser_)});
       case 'getRoadmap': return json_({ok: true, roadmap: getRoadmap_()});
       case 'upsertUser': return json_(locked_(() => upsertUser_(req)));
+      case 'studentSalt': return json_(studentSalt_(req.id));
+      case 'studentRegister': return json_(locked_(() => studentRegister_(req)));
+    }
+    if (/^s[A-Z]/.test(String(req.action))) {
+      const st = studentAuth_(req);
+      switch (req.action) {
+        case 'sMe': return json_({ok: true, student: st});
+        case 'sPackages': return json_({ok: true, packages: sPackages_(st)});
+        case 'sSubmit': return json_(locked_(() => sSubmit_(st, req.code)));
+        case 'sResults': return json_({ok: true, results: sResults_(st, req.examIds || [])});
+        case 'sFeedback': return json_(locked_(() => sFeedback_(st, req.items || [])));
+        default: return json_({ok: false, error: 'Unknown action: ' + req.action});
+      }
     }
     const me = authUser_(req);
     const owner = me.role === 'Owner';
@@ -406,6 +425,12 @@ function doPost(e) {
       case 'saveBackup': return json_(saveBackup_(req, me));
       case 'listBackups': return json_({ok: true, backups: listBackups_(me)});
       case 'getBackup': return json_(getBackup_(req.id, me));
+      case 'publishPackage': return json_(locked_(() => publishPackage_(req, me)));
+      case 'revokePackage': return json_(locked_(() => revokePackage_(req.pkgId, me)));
+      case 'listSubmissions': return json_({ok: true, submissions: listSubmissions_(req.examIds || [], me)});
+      case 'publishResults': return json_(locked_(() => publishResults_(req, me)));
+      case 'listStudentAccounts': if (!owner) return denied_(); return json_({ok: true, accounts: readStudentAccounts_().map(a => { delete a.authVerifier; delete a.row; return a; })});
+      case 'resetStudent': if (!owner) return denied_(); return json_(locked_(() => resetStudent_(req.id, me)));
       default: return json_({ok: false, error: 'Unknown action: ' + req.action});
     }
   } catch (err) {
@@ -611,6 +636,144 @@ function getBackup_(id, me) {
   if (!inFolder) return {ok: false, error: 'That file is not in the SOES Backups folder.'};
   return {ok: true, name: f.getName(), content: f.getBlob().getDataAsString()};
 }
+
+/* ================= version 3: mobile app support ================= */
+function folder_(name) {
+  const props = PropertiesService.getScriptProperties(); const key = 'SOES_FOLDER_' + name.replace(/\W+/g, '_').toUpperCase(); const id = props.getProperty(key);
+  if (id) { try { return DriveApp.getFolderById(id); } catch (e) {} }
+  const f = DriveApp.createFolder(name); props.setProperty(key, f.getId()); return f;
+}
+function filesWithMeta_(folderName) {
+  const out = []; const it = folder_(folderName).getFiles();
+  while (it.hasNext()) { const f = it.next(); let m = {}; try { m = JSON.parse(f.getDescription() || '{}'); } catch (e) {} out.push({file: f, meta: m}); }
+  return out;
+}
+function decodeCode_(prefix, code) {
+  code = String(code || '').trim(); if (code.indexOf(prefix) !== 0) return null;
+  let b = code.slice(prefix.length); while (b.length % 4) b += '=';
+  try { return JSON.parse(Utilities.newBlob(Utilities.base64DecodeWebSafe(b)).getDataAsString('UTF-8')); } catch (e) { return null; }
+}
+const normId_ = s => String(s || '').trim().toUpperCase().replace(/\s+/g, '');
+const secKey_ = s => String(s || '').toLowerCase().replace(/\s+/g, '');
+
+/* ---------- student accounts (tab "Student Accounts" in SOES Student Registry) ---------- */
+const SA_HEAD = ['Student ID', 'Registered At', 'Auth Salt', 'Auth Verifier', 'Hash Iterations', 'Status', 'Last Sync', 'Reset By'];
+function studentSheet_() {
+  const ss = SpreadsheetApp.openById(SOES.STUDENTS_ID); let sh = ss.getSheetByName('Student Accounts');
+  if (!sh) { sh = ss.insertSheet('Student Accounts'); sh.getRange(1, 1, 1, SA_HEAD.length).setValues([SA_HEAD]).setFontWeight('bold'); sh.setFrozenRows(1); }
+  return sh;
+}
+function readStudentAccounts_() {
+  const sh = studentSheet_(); const n = sh.getLastRow() - 1; if (n < 1) return [];
+  return sh.getRange(2, 1, n, SA_HEAD.length).getDisplayValues().map((r, i) => ({row: i + 2, id: normId_(r[0]), registeredAt: r[1], authSalt: r[2], authVerifier: r[3], iter: Number(r[4]) || 120000, status: r[5] || 'Active', lastSync: r[6], resetBy: r[7]})).filter(a => a.id);
+}
+function registryRecord_(id) { return getStudents_().find(s => normId_(s.id) === id); }
+function studentSalt_(id) {
+  id = normId_(id); const a = readStudentAccounts_().find(x => x.id === id && x.status === 'Active');
+  if (!a) return {ok: false, error: 'This student ID has no SOES account yet. Register first.'};
+  return {ok: true, authSalt: a.authSalt, iter: a.iter};
+}
+function studentRegister_(req) {
+  const id = normId_(req.id), last = String(req.last || '').trim().toLowerCase(), pin = req.pin || {};
+  if (!/^[A-Z0-9-]{3,20}$/.test(id)) return {ok: false, error: 'Enter your official student ID.'};
+  if (!pin.authSalt || !pin.authVerifier) return {ok: false, error: 'The PIN data is incomplete.'};
+  const reg = registryRecord_(id);
+  if (!reg || String(reg.last || '').trim().toLowerCase() !== last) return {ok: false, error: 'That student ID and last name do not match the Student Registry. Check both, or ask your teacher.'};
+  if (!/^enrolled$/i.test(reg.status)) return {ok: false, error: 'Your registry status is ' + reg.status + '. Ask your teacher.'};
+  const accts = readStudentAccounts_(); const old = accts.find(a => a.id === id);
+  if (old && old.status === 'Active') return {ok: false, error: 'This student ID is already registered. Sign in with your PIN, or ask your teacher or the system owner to reset your account.'};
+  const row = ["'" + id, new Date(), pin.authSalt, pin.authVerifier, Number(pin.iter) || 120000, 'Active', '', ''];
+  const sh = studentSheet_();
+  if (old) sh.getRange(old.row, 1, 1, SA_HEAD.length).setValues([row]); else sh.getRange(sh.getLastRow() + 1, 1, 1, SA_HEAD.length).setValues([row]);
+  return {ok: true, student: {id: id, last: reg.last, first: reg.first, section: reg.section, grade: reg.grade}};
+}
+function studentAuth_(req) {
+  const id = normId_(req.sid), cache = CacheService.getScriptCache();
+  if (!id || !req.stoken) throw new Error('Sign in again while online.');
+  if (cache.get('soes_lock_' + id)) throw new Error('Too many wrong PINs. Try again in ' + STUDENT_LOCK_MINUTES + ' minutes, or ask your teacher.');
+  const a = readStudentAccounts_().find(x => x.id === id && x.status === 'Active');
+  if (!a || sha256b64u_(String(req.stoken)) !== a.authVerifier) {
+    const n = Number(cache.get('soes_fail_' + id) || 0) + 1; cache.put('soes_fail_' + id, String(n), STUDENT_LOCK_MINUTES * 60);
+    if (n >= STUDENT_LOCK_AFTER) { cache.put('soes_lock_' + id, '1', STUDENT_LOCK_MINUTES * 60); cache.remove('soes_fail_' + id); }
+    throw new Error(a ? 'Wrong PIN for this student account.' : 'This student ID has no active SOES account. Register again or ask your teacher.');
+  }
+  cache.remove('soes_fail_' + id);
+  const reg = registryRecord_(id);
+  if (!reg || !/^enrolled$/i.test(reg.status)) throw new Error('Your Student Registry record is not active. Ask your teacher.');
+  studentSheet_().getRange(a.row, 7).setValue(new Date());
+  return {id: id, last: reg.last, first: reg.first, section: reg.section, grade: reg.grade};
+}
+function resetStudent_(id, me) {
+  id = normId_(id); const a = readStudentAccounts_().find(x => x.id === id); if (!a) return {ok: false, error: 'No account for that student ID.'};
+  studentSheet_().getRange(a.row, 6, 1, 3).setValues([['Reset', a.lastSync, me.username]]);
+  return {ok: true};
+}
+
+/* ---------- packages, submissions, results ---------- */
+function publishPackage_(req, me) {
+  const m = req.meta || {}; const code = String(req.code || '');
+  if (!decodeCode_('SOES1.', code)) return {ok: false, error: 'That is not a SOES package.'};
+  if (!m.pkgId || !m.examId) return {ok: false, error: 'The package details are incomplete.'};
+  const existing = filesWithMeta_('SOES Packages').find(x => x.meta.pkgId === m.pkgId);
+  if (existing) return {ok: true, already: true};
+  const meta = {pkgId: m.pkgId, examId: m.examId, version: m.version, section: m.section || '', title: m.title || '', subject: m.subject || '', activityType: m.activityType || '',
+    opensAt: Number(m.opensAt) || 0, closesAt: Number(m.closesAt) || 0, owner: me.username, revoked: false, at: Date.now()};
+  const f = folder_('SOES Packages').createFile(m.examId + '_v' + m.version + '_' + m.pkgId + '.soes', code, MimeType.PLAIN_TEXT);
+  f.setDescription(JSON.stringify(meta));
+  return {ok: true};
+}
+function revokePackage_(pkgId, me) {
+  const x = filesWithMeta_('SOES Packages').find(p => p.meta.pkgId === pkgId); if (!x) return {ok: true, missing: true};
+  if (me.role !== 'Owner' && x.meta.owner !== me.username) return {ok: false, error: 'This package belongs to another teacher.'};
+  x.meta.revoked = true; x.file.setDescription(JSON.stringify(x.meta)); return {ok: true};
+}
+function sPackages_(st) {
+  const now = Date.now(), mine = secKey_(st.section);
+  return filesWithMeta_('SOES Packages').filter(x => {
+    const secs = String(x.meta.section || '').split(/[,;]/).map(secKey_).filter(String);
+    return !x.meta.revoked && x.meta.closesAt > now && (!secs.length || secs.indexOf(mine) >= 0);
+  }).map(x => ({meta: x.meta, code: x.file.getBlob().getDataAsString()}));
+}
+function sSubmit_(st, code) {
+  const sub = decodeCode_('SOESSUB1.', code);
+  if (!sub || sub.format !== 'SOES-SUB' || !sub.attemptId || !sub.examId) return {ok: false, error: 'That is not a complete SOES submission.'};
+  if (normId_(sub.student && sub.student.no) !== st.id) return {ok: false, error: 'This submission belongs to another student ID.'};
+  const name = sub.examId + '__' + sub.attemptId + '.soesub';
+  const dup = filesWithMeta_('SOES Submissions').find(x => x.meta.attemptId === sub.attemptId);
+  if (dup) return {ok: true, already: true, receivedAt: dup.meta.at};
+  const pkg = filesWithMeta_('SOES Packages').find(x => x.meta.examId === sub.examId);
+  const meta = {attemptId: sub.attemptId, examId: sub.examId, version: sub.version, sid: st.id, owner: pkg ? pkg.meta.owner : '', at: Date.now()};
+  folder_('SOES Submissions').createFile(name, String(code).trim(), MimeType.PLAIN_TEXT).setDescription(JSON.stringify(meta));
+  return {ok: true, receivedAt: meta.at};
+}
+function listSubmissions_(examIds, me) {
+  return filesWithMeta_('SOES Submissions').filter(x => examIds.indexOf(x.meta.examId) >= 0 && (me.role === 'Owner' || x.meta.owner === me.username))
+    .slice(0, 800).map(x => ({attemptId: x.meta.attemptId, examId: x.meta.examId, sid: x.meta.sid, at: x.meta.at, code: x.file.getBlob().getDataAsString()}));
+}
+function publishResults_(req, me) {
+  const r = decodeCode_('SOESRES1.', req.code);
+  if (!r || r.format !== 'SOES-RES' || r.examId !== req.examId) return {ok: false, error: 'That is not a SOES results file.'};
+  const pkg = filesWithMeta_('SOES Packages').find(x => x.meta.examId === req.examId);
+  if (pkg && me.role !== 'Owner' && pkg.meta.owner !== me.username) return {ok: false, error: 'This activity belongs to another teacher.'};
+  const meta = {examId: req.examId, version: req.version, owner: me.username, at: Date.now()};
+  folder_('SOES Results').createFile(req.examId + '_v' + req.version + '_' + meta.at + '.soesres', String(req.code).trim(), MimeType.PLAIN_TEXT).setDescription(JSON.stringify(meta));
+  return {ok: true};
+}
+function sResults_(st, examIds) {
+  const latest = {};
+  filesWithMeta_('SOES Results').forEach(x => { if (examIds.indexOf(x.meta.examId) < 0) return; const k = x.meta.examId + '|' + x.meta.version; if (!latest[k] || latest[k].meta.at < x.meta.at) latest[k] = x; });
+  return Object.keys(latest).map(k => ({examId: latest[k].meta.examId, version: latest[k].meta.version, code: latest[k].file.getBlob().getDataAsString()}));
+}
+function sFeedback_(st, items) {
+  const sh = improveSheet_('Suggestions'); const have = readFeedback_().map(x => x.id); let added = 0;
+  items.slice(0, 20).forEach(x => {
+    if (!x.id || have.indexOf(String(x.id)) >= 0) return;
+    sh.appendRow([x.at ? new Date(x.at) : new Date(), safe_(x.id), 'Student', x.includeName ? st.id : 'Student', x.includeName ? safe_(st.last + ', ' + st.first) : '', safe_(st.section),
+      safe_(x.category), safe_(String(x.title || '').slice(0, 140)), safe_(String(x.details || '').slice(0, 2000)), 'New', '', '', new Date(), '']);
+    have.push(String(x.id)); added++;
+  });
+  return {ok: true, added: added, replies: readFeedback_().filter(f => items.some(i => String(i.id) === f.id) || f.from === st.id).map(f => ({id: f.id, status: f.status, response: f.response}))};
+}
 </script>
 <script>window.SOES_PORTAL='student';</script>
 <script>
@@ -665,7 +828,8 @@ const b64u = {
   dec(str) { str = str.replace(/-/g, '+').replace(/_/g, '/'); while (str.length % 4) str += '='; const s = atob(str); const u = new Uint8Array(s.length); for (let i = 0; i < s.length; i++) u[i] = s.charCodeAt(i); return u; }
 };
 const packJSON = (prefix, o) => prefix + b64u.enc(enc.encode(JSON.stringify(o)));
-const unpackJSON = (prefix, code) => { code = String(code || '').trim(); if (!code.startsWith(prefix)) return null; try { return JSON.parse(dec.decode(b64u.dec(code.slice(prefix.length)))); } catch (e) { return undefined; } };
+const cleanCode = (prefix, code) => { const c = String(code || '').replace(/[\r\n\t\u200B-\u200D\u2060\uFEFF]/g, '').trim(); const i = c.indexOf(prefix); if (i < 0) return c; const m = c.slice(i + prefix.length).match(/^[A-Za-z0-9_-]+/); return prefix + (m ? m[0] : ''); };
+const unpackJSON = (prefix, code) => { code = cleanCode(prefix, code); if (!code.startsWith(prefix)) return null; try { return JSON.parse(dec.decode(b64u.dec(code.slice(prefix.length)))); } catch (e) { return undefined; } };
 
 /* ================= security ================= */
 async function aesKeyFromPass(pass, salt, iter) {
@@ -1465,7 +1629,7 @@ function oBackup() {
   return `<div class="grid2"><section class="panel"><h2>Full system backup</h2><p class="muted sm">Everything on this device: accounts (hashes only), activities, answer keys, exam passwords, submissions, scores, suggestions, and the audit log. Store it as a confidential record under the Data Privacy Act of 2012.</p>
    <div class="row"><button class="btn primary" data-act="bk-sys">Create backup file</button><button class="btn" data-act="bk-sys-drive" ${connected() ? '' : 'disabled'}>Save to Google Drive</button><button class="btn ghost" data-act="bk-drive-list" ${connected() ? '' : 'disabled'}>Show Drive backups</button></div>
    <div id="drive-list">${RTO.driveHtml || ''}</div></section>
-  <section class="panel"><h2>Restore</h2><p class="muted sm">Restoring a system backup replaces everything on this device. Create a backup first if you are unsure.</p><label class="field"><span>Backup file</span><input type="file" id="rs-file" accept=".soesbak,.txt,.json"></label><label class="field"><span>Or paste the backup text</span><textarea id="rs-text" rows="3" class="mono sm" placeholder="SOESBAK1.…"></textarea></label><div><button class="btn" data-act="rs-sys">Restore system backup</button></div></section></div>
+  <section class="panel"><h2>Restore</h2><p class="muted sm">Restoring a system backup replaces everything on this device. Create a backup first if you are unsure.</p><label class="field"><span>Backup file</span><input type="file" id="rs-file"></label><label class="field"><span>Or paste the backup text</span><textarea id="rs-text" rows="3" class="mono sm" placeholder="SOESBAK1.…"></textarea></label><div><button class="btn" data-act="rs-sys">Restore system backup</button></div></section></div>
   <section class="panel"><h2>Sample data</h2><p class="muted sm">${samples ? `This device has sample teacher accounts, a sample class list, sample activities, and simulated results for testing. Remove them before entering real records.` : 'No sample data on this device.'}</p><div class="row"><button class="btn" data-act="rm-sample" ${samples ? '' : 'disabled'}>Remove sample data</button><button class="btn ghost dt" data-act="reset-all">Reset everything on this device</button></div></section>`;
 }
 function oSheets() {
@@ -1669,7 +1833,7 @@ function tResults() {
   const pend = subs.filter(s => s.cloud === 'pending').length;
   const lastRel = e ? T.resultReleases.filter(r => r.examId === e.id).sort((a, b) => b.at - a.at)[0] : null;
   return `<section class="panel"><div class="formgrid" style="gap:6px"><h2>Import submissions</h2><p class="muted sm">Add the submission files students send you. Each one is checked for damage, edits after the exam, duplicates, and the right version before it is scored. Student suggestions inside them go to Improvements.</p></div>
-   <div class="grid2"><label class="field"><span>Submission files (.soesub)</span><input type="file" id="imp-files" multiple accept=".soesub,.txt"></label>
+   <div class="grid2"><label class="field"><span>Submission files (.soesub)</span><input type="file" id="imp-files" multiple></label>
    <label class="field"><span>Or paste submission or suggestion codes, one per line</span><textarea id="imp-paste" rows="3" class="mono sm" placeholder="SOESSUB1.…"></textarea></label></div>
    <div class="row"><button class="btn primary" data-act="imp-run">Import and score</button></div><div id="imp-out">${RT.impOut}</div></section>
   ${e ? `<section class="panel"><div class="row between"><label class="field" style="min-width:min(100%,320px)"><span>Activity</span><select id="res-exam">${exs.map(x => `<option value="${x.id}" ${x.id === RTT.resExam ? 'selected' : ''}>${esc(x.title)} · ${esc(x.section)}</option>`).join('')}</select></label>
@@ -1775,7 +1939,7 @@ function tAccount() {
   return `${accountPanel(u)}
   <div class="grid2"><section class="panel"><h2>Backup of my work</h2><p class="muted sm">Your activities (answer keys, passwords, versions), imported submissions, scores, reconnection log, and suggestions. Keep the file private.</p>
    <div class="row"><button class="btn primary" data-act="bk-t">Create backup file</button><button class="btn" data-act="bk-t-drive" ${connected() ? '' : 'disabled'}>Save to Google Drive</button><button class="btn ghost" data-act="bk-drive-list" ${connected() ? '' : 'disabled'}>Show my Drive backups</button></div><div id="drive-list">${RTO.driveHtml || ''}</div>
-   <label class="field"><span>Restore from a backup file</span><input type="file" id="rs-file" accept=".soesbak,.txt,.json"></label><label class="field"><span>Or paste the backup text</span><textarea id="rs-text" rows="2" class="mono sm" placeholder="SOESBAK1.…"></textarea></label><div><button class="btn" data-act="rs-t">Restore into my work</button></div><p class="sm muted">Restoring adds missing activities and submissions and updates activities with the same ID. Nothing else is removed.</p></section>
+   <label class="field"><span>Restore from a backup file</span><input type="file" id="rs-file"></label><label class="field"><span>Or paste the backup text</span><textarea id="rs-text" rows="2" class="mono sm" placeholder="SOESBAK1.…"></textarea></label><div><button class="btn" data-act="rs-t">Restore into my work</button></div><p class="sm muted">Restoring adds missing activities and submissions and updates activities with the same ID. Nothing else is removed.</p></section>
   <section class="panel"><h2>Google Sheets on this device</h2>${connected() ? `<p class="sm">Connected${c.lastOk ? `, last checked ${fmtDT(c.lastOk)}` : ''}.</p><div class="row"><button class="btn" data-act="t-sync">Sync my account and class lists</button><a class="btn ghost" href="${gsUrl(GS.scores.id)}" target="_blank" rel="noopener">Open Score Records</a></div>` : connectForm()}</section></div>`;
 }
 function connectForm() {
@@ -1839,7 +2003,7 @@ function quizCardHtml(c) {
     : c.state === 'finished' ? `<button class="btn" data-act="s-done" data-a="${c.done.id}">Submission status</button>`
     : c.state === 'open' ? `<button class="btn primary" data-act="s-open" data-p="${c.id}">Start ${esc(m.activityType.toLowerCase())}</button>`
     : `<button class="btn" disabled>${c.state === 'upcoming' ? 'Not open yet' : 'Closed'}</button>`;
-  return `<article class="qz"><div class="row between"><div><p class="eyebrow">${esc(m.activityType)} · ${esc(m.subject)}</p><h3>${esc(m.title)}</h3><p class="sm muted">${esc(m.teacher || '')}${m.teacher ? ' · ' : ''}${esc(m.section || 'All sections')} · Version ${m.version}</p></div>${c.chip}</div>
+  return `<article class="qz"><div class="row between"><div><p class="eyebrow">${esc(m.activityType)} · ${esc(m.subject)}</p><h3>${esc(m.title)}</h3><p class="sm muted">${esc(m.teacher || '')}${m.teacher ? ' · ' : ''}${esc(m.section || 'All sections')} · Version ${m.version}</p></div><div class="row">${c.assigned ? '' : `<span class="chip warn">For ${esc(m.section)}</span>`}${c.chip}</div></div>
    <dl class="facts"><div><dt>Duration</dt><dd>${m.durationMin} min</dd></div><div><dt>Items</dt><dd>${m.itemCount} · ${plural(m.totalPoints, 'pt')}</dd></div><div><dt>Opens</dt><dd>${fmtDT(m.opensAt)}</dd></div><div><dt>Closes</dt><dd>${fmtDT(m.closesAt)}</dd></div></dl>
    <div class="row">${btn}${c.state === 'open' || c.state === 'upcoming' ? '<span class="sm muted">Questions stay locked until your teacher gives the exam password.</span>' : ''}</div></article>`;
 }
@@ -1862,13 +2026,13 @@ function sQuizzes(pr) {
   ${grp('Upcoming', mine.filter(c => c.state === 'upcoming').sort((a, b) => a.m.opensAt - b.m.opensAt), 'No upcoming quizzes on this device.')}
   ${grp('Finished', mine.filter(c => ['finished', 'scored'].includes(c.state)), 'You have not finished a quiz yet.')}
   ${mine.some(c => c.state === 'closed') ? grp('Closed', mine.filter(c => c.state === 'closed'), '') : ''}
-  ${other.length ? `<section class="formgrid"><h2>Other sections</h2><p class="sm muted">These packages are for other sections. If one is yours, ask your teacher.</p>${other.map(c => `<div class="row between qz"><span><b>${esc(c.m.title)}</b> <span class="muted sm">${esc(c.m.section)}</span></span><button class="btn sm ghost" data-act="s-remove" data-p="${c.id}">Remove from device</button></div>`).join('')}</section>` : ''}`;
+  ${other.length ? `<section class="formgrid"><h2>Other sections</h2><p class="sm muted">These quizzes are set for a section that is spelled differently from the one in your profile (${esc(pr.section)}). If a quiz is yours, you can still open it, or fix your section under Profile &amp; backup.</p>${other.map(c => quizCardHtml(c) + `<div class="row end" style="margin-top:-6px"><button class="btn sm ghost" data-act="s-remove" data-p="${c.id}">Remove from device</button></div>`).join('')}</section>` : ''}`;
 }
 function sScores(pr) {
   if (RTS.detail && S.results[RTS.detail]) return resultDetail(S.results[RTS.detail]);
   const res = myResults(pr);
   const waiting = myAttempts(pr).filter(a => ['submitted', 'expired'].includes(a.status) && !S.results[a.id]);
-  return `<section class="panel"><h2>Add released results</h2><p class="muted sm">When your teacher releases results, you get a results file or code. It holds only your own result, locked to the exam you took on this device.</p><div class="grid2"><label class="field"><span>Results file (.soesres)</span><input type="file" id="res-file" accept=".soesres,.txt"></label><label class="field"><span>Or paste the results code</span><textarea id="res-code" rows="2" class="mono sm" placeholder="SOESRES1.…"></textarea></label></div><div><button class="btn primary" data-act="res-add">Add results</button></div></section>
+  return `<section class="panel"><h2>Add released results</h2><p class="muted sm">When your teacher releases results, you get a results file or code. It holds only your own result, locked to the exam you took on this device.</p><div class="grid2"><label class="field"><span>Results file (.soesres)</span><input type="file" id="res-file"></label><label class="field"><span>Or paste the results code</span><textarea id="res-code" rows="2" class="mono sm" placeholder="SOESRES1.…"></textarea></label></div><div><button class="btn primary" data-act="res-add">Add results</button></div></section>
   ${res.length ? `<section class="panel"><h2>My scores</h2><div class="table-wrap"><table><thead><tr><th>Activity</th><th>Date</th><th class="num">Score</th><th style="min-width:150px">Percent</th><th>Level</th><th class="num">Class avg.</th><th></th></tr></thead><tbody>${res.slice().reverse().map(r => `<tr><td><b>${esc(r.title)}</b><div class="sm muted">${esc(r.activityType)} · ${esc(r.subject)}</div></td><td class="sm">${fmtD(r.finalizedAt)}</td><td class="num">${r.final} / ${r.max}</td><td><div class="row" style="flex-wrap:nowrap"><div class="ibar ${r.pct < 50 ? 'danger' : r.pct < T_MASTERY() ? 'warn' : 'ok'}" style="flex:1"><i style="width:${Math.min(100, r.pct)}%"></i></div><b class="mono">${r.pct}%</b></div></td><td><span class="chip ${mpsLabel(r.pct)[1]}">${mpsLabel(r.pct)[0]}</span></td><td class="num">${r.classMps != null ? r.classMps + '%' : '—'}</td><td><button class="btn sm" data-act="s-result" data-a="${r.attemptId}">Review</button></td></tr>`).join('')}</tbody></table></div></section>` : '<div class="panel"><p class="muted">No released results yet.</p></div>'}
   ${waiting.length ? `<section class="panel"><h2>Waiting for results</h2>${waiting.map(a => `<div class="row between"><span><b>${esc(a.title)}</b> <span class="sm muted">finished ${fmtDT(a.finalizedAt)}</span></span><span class="row">${a.transfer.accepted ? '<span class="chip ok">Received by teacher</span>' : '<span class="chip warn">Not yet confirmed</span>'}<button class="btn sm" data-act="s-done" data-a="${a.id}">Submission status</button></span></div>`).join('')}</section>` : ''}`;
 }
@@ -1930,10 +2094,11 @@ function sImprove(pr) {
 function sProfile(pr) {
   const atts = myAttempts(pr), res = myResults(pr);
   return `<div class="grid2"><section class="panel"><h2>My profile</h2><dl class="facts"><div><dt>Student ID</dt><dd>${esc(pr.no)}</dd></div><div><dt>Name</dt><dd>${esc(pr.name)}</dd></div><div><dt>Section</dt><dd>${esc(pr.section)}</dd></div><div><dt>On this device since</dt><dd>${fmtD(pr.created)}</dd></div><div><dt>Finished quizzes</dt><dd>${atts.filter(a => a.finalizedAt).length}</dd></div><div><dt>Released results</dt><dd>${res.length}</dd></div></dl>
+   <form data-form="sec-change" class="formgrid"><h3>Section</h3><div class="row"><input id="sc-sec" value="${esc(pr.section)}" style="max-width:240px"><button class="btn">Save section</button></div><p class="sm muted">Type it exactly as your teacher writes it, for example STEM 11-A.</p></form>
    <form data-form="pin-change" class="formgrid"><h3>Change PIN</h3><div class="grid3"><label class="field"><span>Current PIN</span><input id="pc-cur" type="password" inputmode="numeric" maxlength="6"></label><label class="field"><span>New PIN</span><input id="pc-new" type="password" inputmode="numeric" maxlength="6"></label><label class="field"><span>Repeat</span><input id="pc-rep" type="password" inputmode="numeric" maxlength="6"></label></div><div><button class="btn">Change PIN</button></div></form>
    <div class="row"><button class="btn" data-act="s-check">Check this device</button><button class="btn ghost dt" data-act="sp-remove">Remove my profile from this device</button></div></section>
   <section class="panel"><h2>Backup of my work</h2><p class="muted sm">Saves your profile, quiz packages, finished submissions, released results, and suggestions. Use it to move to another device or to recover after resetting this one. Keep the file private.</p><div><button class="btn primary" data-act="bk-s">Create backup file</button></div>
-   <label class="field"><span>Restore from a backup file</span><input type="file" id="rs-file" accept=".soesbak,.txt"></label><label class="field"><span>Or paste the backup text</span><textarea id="rs-text" rows="2" class="mono sm" placeholder="SOESBAK1.…"></textarea></label><div><button class="btn" data-act="rs-s">Restore</button></div><p class="sm muted">Restoring adds what is missing. It cannot reopen or change a finished exam.</p></section></div>`;
+   <label class="field"><span>Restore from a backup file</span><input type="file" id="rs-file"></label><label class="field"><span>Or paste the backup text</span><textarea id="rs-text" rows="2" class="mono sm" placeholder="SOESBAK1.…"></textarea></label><div><button class="btn" data-act="rs-s">Restore</button></div><p class="sm muted">Restoring adds what is missing. It cannot reopen or change a finished exam.</p></section></div>`;
 }
 function sStart(pid) {
   const P = S.packages[pid], m = P.meta, pr = myProfile(), lock = P.lockUntil > Date.now();
@@ -2183,14 +2348,14 @@ async function deviceCheck() {
 function addPkgModal() {
   const ob = LS.get(OBK, []).filter(o => !S.packages[o.pkgId]);
   openModal(`<h3>Add a quiz package</h3><p class="muted sm">Use the file or code your teacher shared. The questions stay locked until exam time.</p>
-  <label class="field"><span>Package file (.soes)</span><input type="file" id="add-file" accept=".soes,.txt"></label>
+  <label class="field"><span>Package file (.soes)</span><input type="file" id="add-file"></label>
   <label class="field"><span>Or paste the package code</span><textarea id="add-code" rows="4" class="mono sm" placeholder="SOES1.…"></textarea></label>
   <div class="row end"><button class="btn primary" data-act="s-add-go">Add package</button></div>
   ${ob.length && !PORTAL_LOCK ? `<div class="shortcut"><p class="eyebrow">Prototype shortcut</p><p class="sm muted">Packages generated in this browser's Teacher portal:</p>${ob.map(o => `<div class="row between"><span class="sm">${esc(o.title)} · v${o.version} · <code>${o.pkgId}</code></span><button class="btn sm" data-act="s-add-ob" data-p="${o.pkgId}">Add</button></div>`).join('')}</div>` : ''}`);
 }
 function addPackage(code) {
   const pkg = parsePackage(code);
-  S.packages[pkg.meta.pkgId] = {code:code.trim(), meta:pkg.meta, addedAt:Date.now(), fails:0, lockUntil:0};
+  S.packages[pkg.meta.pkgId] = {code:cleanCode(PKG_PREFIX, code), meta:pkg.meta, addedAt:Date.now(), fails:0, lockUntil:0};
   saveS(); closeModal(); toast(`Added: ${pkg.meta.title} (version ${pkg.meta.version})`, 'ok'); render();
 }
 function studentBackupData(pr) {
@@ -2593,6 +2758,7 @@ document.addEventListener('submit', async ev => {
       if (await pbkdf2(pin, pr.salt, 60000) !== pr.pinHash) { pr.fails = (pr.fails || 0) + 1; if (pr.fails % 5 === 0) pr.until = Date.now() + 60000; saveS(); RT.signinErr = 'Wrong PIN.'; render(); return; }
       pr.fails = 0; saveS(); RT.session = {portal:'student', profile:pr.no}; RT.pickProfile = null; RT.signinErr = ''; RTS.tab = 'home'; RTS.detail = null; RT.view = 'home'; render();
     }); break;
+    case 'sec-change': { const pr = myProfile(); const v = val('sc-sec').trim(); if (!v) { toast('Enter your section.', 'warn'); return; } pr.section = v; saveS(); render(); toast('Section saved.', 'ok'); break; }
     case 'pin-change': await run(async () => {
       const pr = myProfile(), cur = val('pc-cur'), a = val('pc-new'), b = val('pc-rep');
       if (await pbkdf2(cur, pr.salt, 60000) !== pr.pinHash) throw new Error('The current PIN is wrong.');
